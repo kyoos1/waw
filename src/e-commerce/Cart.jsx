@@ -1,11 +1,14 @@
 import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
+import { supabase } from "../supabase";
 
 export default function Cart() {
   const [cartItems, setCartItems] = useState([]);
   const [selectedItemForEdit, setSelectedItemForEdit] = useState(null);
   const [selectedColor, setSelectedColor] = useState("");
   const [selectedSize, setSelectedSize] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [userId, setUserId] = useState(null);
 
   const navigate = useNavigate();
 
@@ -25,37 +28,142 @@ export default function Cart() {
   const availableSizes = ["XS", "S", "M", "L", "XL", "2XL"];
 
   useEffect(() => {
-    const stored = localStorage.getItem("cart");
-    if (stored) {
-      try {
-        setCartItems(JSON.parse(stored));
-      } catch (e) {
-        console.error("Error loading cart:", e);
-      }
-    }
+    checkAuth();
   }, []);
 
-  const saveCart = (items) => {
-    setCartItems(items);
-    localStorage.setItem("cart", JSON.stringify(items));
+  useEffect(() => {
+    if (userId) {
+      fetchCartItems();
+    }
+  }, [userId]);
+
+  const checkAuth = async () => {
+    try {
+      const { data: { session }, error } = await supabase.auth.getSession();
+      
+      if (error || !session) {
+        // Check localStorage as fallback
+        const stored = localStorage.getItem("auth");
+        if (stored) {
+          const parsed = JSON.parse(stored);
+          setUserId(parsed.userId);
+        } else {
+          navigate("/");
+        }
+      } else {
+        setUserId(session.user.id);
+      }
+    } catch (error) {
+      console.error("Auth check error:", error);
+      navigate("/");
+    }
   };
 
-  const removeItem = (cartId) => {
-    const updated = cartItems.filter((item) => item.cartId !== cartId);
-    saveCart(updated);
+  const fetchCartItems = async () => {
+    if (!userId) return;
+
+    try {
+      setLoading(true);
+      const { data, error } = await supabase
+        .from('cart')
+        .select(`
+          id,
+          quantity,
+          product_id,
+          product_variant_id,
+          products (
+            id,
+            name,
+            price,
+            image_url
+          ),
+          product_variants (
+            id,
+            color,
+            size
+          )
+        `)
+        .eq('user_id', userId);
+
+      if (error) throw error;
+
+      const formattedItems = data.map(item => ({
+        cartId: item.id,
+        id: item.products.id,
+        name: item.products.name,
+        price: parseFloat(item.products.price),
+        image: item.products.image_url,
+        color: item.product_variants.color,
+        size: item.product_variants.size,
+        quantity: item.quantity,
+        variantId: item.product_variants.id,
+        selected: true
+      }));
+
+      setCartItems(formattedItems);
+    } catch (error) {
+      console.error('Error fetching cart:', error);
+      alert('Failed to load cart items');
+    } finally {
+      setLoading(false);
+    }
   };
 
-  const updateQuantity = (cartId, delta) => {
-    const updated = cartItems.map((item) =>
-      item.cartId === cartId
-        ? { ...item, quantity: Math.max(1, item.quantity + delta) }
-        : item
-    );
-    saveCart(updated);
+  const updateQuantity = async (cartId, delta) => {
+    try {
+      const item = cartItems.find(i => i.cartId === cartId);
+      const newQuantity = Math.max(1, item.quantity + delta);
+
+      const { error } = await supabase
+        .from('cart')
+        .update({ quantity: newQuantity })
+        .eq('id', cartId);
+
+      if (error) throw error;
+
+      setCartItems(cartItems.map(i => 
+        i.cartId === cartId ? { ...i, quantity: newQuantity } : i
+      ));
+    } catch (error) {
+      console.error('Error updating quantity:', error);
+      alert('Failed to update quantity');
+    }
   };
 
-  const clearCart = () => {
-    saveCart([]);
+  const removeItem = async (cartId) => {
+    if (!confirm('Remove this item from cart?')) return;
+
+    try {
+      const { error } = await supabase
+        .from('cart')
+        .delete()
+        .eq('id', cartId);
+
+      if (error) throw error;
+
+      setCartItems(cartItems.filter(item => item.cartId !== cartId));
+    } catch (error) {
+      console.error('Error removing item:', error);
+      alert('Failed to remove item');
+    }
+  };
+
+  const clearCart = async () => {
+    if (!confirm('Clear all items from cart?')) return;
+
+    try {
+      const { error } = await supabase
+        .from('cart')
+        .delete()
+        .eq('user_id', userId);
+
+      if (error) throw error;
+
+      setCartItems([]);
+    } catch (error) {
+      console.error('Error clearing cart:', error);
+      alert('Failed to clear cart');
+    }
   };
 
   const openEditModal = (item) => {
@@ -64,42 +172,146 @@ export default function Cart() {
     setSelectedSize(item.size);
   };
 
-  const saveEditChanges = () => {
+  const saveEditChanges = async () => {
     if (!selectedColor || !selectedSize) return;
 
-    let updated = [...cartItems];
+    try {
+      // Find or create the new variant
+      let { data: variant, error: variantError } = await supabase
+        .from('product_variants')
+        .select('id')
+        .eq('product_id', selectedItemForEdit.id)
+        .eq('color', selectedColor)
+        .eq('size', selectedSize)
+        .single();
 
-    // NEW cartId based on updated selections
-    const newCartId = `${selectedItemForEdit.id}-${selectedColor}-${selectedSize}`;
+      if (variantError && variantError.code === 'PGRST116') {
+        // Create variant if doesn't exist
+        const { data: newVariant, error: createError } = await supabase
+          .from('product_variants')
+          .insert({
+            product_id: selectedItemForEdit.id,
+            color: selectedColor,
+            size: selectedSize,
+            stock: 100
+          })
+          .select()
+          .single();
 
-    // If another item already exists with same new color+size → merge quantities
-    const existing = updated.find(
-      (i) => i.cartId === newCartId && i.cartId !== selectedItemForEdit.cartId
-    );
+        if (createError) throw createError;
+        variant = newVariant;
+      } else if (variantError) {
+        throw variantError;
+      }
 
-    if (existing) {
-      existing.quantity += selectedItemForEdit.quantity;
-      updated = updated.filter((i) => i.cartId !== selectedItemForEdit.cartId);
-    } else {
-      updated = updated.map((i) =>
-        i.cartId === selectedItemForEdit.cartId
-          ? {
-              ...i,
-              color: selectedColor,
-              size: selectedSize,
-              cartId: newCartId,
-            }
-          : i
-      );
+      // Check if cart already has this variant
+      const { data: existingItem } = await supabase
+        .from('cart')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('product_id', selectedItemForEdit.id)
+        .eq('product_variant_id', variant.id)
+        .single();
+
+      if (existingItem && existingItem.id !== selectedItemForEdit.cartId) {
+        // Merge quantities
+        const { error: updateError } = await supabase
+          .from('cart')
+          .update({ quantity: existingItem.quantity + selectedItemForEdit.quantity })
+          .eq('id', existingItem.id);
+
+        if (updateError) throw updateError;
+
+        // Delete old item
+        const { error: deleteError } = await supabase
+          .from('cart')
+          .delete()
+          .eq('id', selectedItemForEdit.cartId);
+
+        if (deleteError) throw deleteError;
+      } else {
+        // Update current item
+        const { error } = await supabase
+          .from('cart')
+          .update({ product_variant_id: variant.id })
+          .eq('id', selectedItemForEdit.cartId);
+
+        if (error) throw error;
+      }
+
+      setSelectedItemForEdit(null);
+      await fetchCartItems();
+    } catch (error) {
+      console.error('Error updating item:', error);
+      alert('Failed to update item');
     }
-
-    saveCart(updated);
-    setSelectedItemForEdit(null);
   };
 
   const subtotal = cartItems
     .filter((item) => item.selected !== false)
     .reduce((sum, item) => sum + item.price * item.quantity, 0);
+
+  const handleCheckout = async () => {
+    const selectedItems = cartItems.filter(item => item.selected !== false);
+    
+    if (selectedItems.length === 0) {
+      alert('Please select items to checkout');
+      return;
+    }
+
+    try {
+      // Create order
+      const { data: order, error: orderError } = await supabase
+        .from('orders')
+        .insert({
+          user_id: userId,
+          total: subtotal,
+          status: 'pending'
+        })
+        .select()
+        .single();
+
+      if (orderError) throw orderError;
+
+      // Create order items
+      const orderItems = selectedItems.map(item => ({
+        order_id: order.id,
+        product_id: item.id,
+        product_variant_id: item.variantId,
+        quantity: item.quantity,
+        price: item.price
+      }));
+
+      const { error: itemsError } = await supabase
+        .from('order_items')
+        .insert(orderItems);
+
+      if (itemsError) throw itemsError;
+
+      // Remove items from cart
+      const cartIds = selectedItems.map(item => item.cartId);
+      const { error: deleteError } = await supabase
+        .from('cart')
+        .delete()
+        .in('id', cartIds);
+
+      if (deleteError) throw deleteError;
+
+      alert('Order placed successfully!');
+      await fetchCartItems();
+    } catch (error) {
+      console.error('Checkout error:', error);
+      alert('Failed to place order. Please try again.');
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-gray-100 flex items-center justify-center">
+        <div className="text-gray-600">Loading cart...</div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-gray-100 pb-24">
@@ -139,7 +351,7 @@ export default function Cart() {
                   ...item,
                   selected: e.target.checked
                 }));
-                saveCart(updated);
+                setCartItems(updated);
               }}
             />
             <span className="font-medium text-gray-700">Select All</span>
@@ -182,7 +394,7 @@ export default function Cart() {
                         ? { ...c, selected: e.target.checked }
                         : c
                     );
-                    saveCart(updated);
+                    setCartItems(updated);
                   }}
                 />
 
@@ -255,7 +467,10 @@ export default function Cart() {
             </span>
           </div>
 
-          <button className="bg-orange-500 hover:bg-orange-600 text-white px-8 py-3 rounded-lg font-medium">
+          <button 
+            onClick={handleCheckout}
+            className="bg-orange-500 hover:bg-orange-600 text-white px-8 py-3 rounded-lg font-medium"
+          >
             Checkout
           </button>
         </div>

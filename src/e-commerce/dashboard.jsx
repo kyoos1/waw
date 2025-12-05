@@ -2,7 +2,6 @@
 import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { supabase } from "../supabase";
-import { useAuth } from "../contexts/AuthContext";
 
 export default function Dashboard() {
   const [activeCategory, setActiveCategory] = useState("All");
@@ -13,9 +12,9 @@ export default function Dashboard() {
   const [selectedSize, setSelectedSize] = useState("");
   const [products, setProducts] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [userId, setUserId] = useState(null);
   
   const navigate = useNavigate();
-  const { user } = useAuth();
 
   const availableColors = [
     { name: "White", hex: "#FFFFFF", border: true },
@@ -34,12 +33,26 @@ export default function Dashboard() {
   const categories = ["All", "Men's", "Women's", "Unisex"];
 
   useEffect(() => {
+    // Get user from localStorage
+    const stored = localStorage.getItem("auth");
+    if (stored) {
+      try {
+        const parsed = JSON.parse(stored);
+        setUserId(parsed.userId);
+      } catch (e) {
+        console.error("Error parsing auth:", e);
+      }
+    }
+    
     fetchProducts();
-    if (user) {
+  }, []);
+
+  useEffect(() => {
+    if (userId) {
       fetchFavorites();
       fetchCartCount();
     }
-  }, [user]);
+  }, [userId]);
 
   const fetchProducts = async () => {
     try {
@@ -59,11 +72,13 @@ export default function Dashboard() {
   };
 
   const fetchFavorites = async () => {
+    if (!userId) return;
+    
     try {
       const { data, error } = await supabase
         .from('favorites')
         .select('product_id')
-        .eq('user_id', user.id);
+        .eq('user_id', userId);
 
       if (error) throw error;
       setFavorites(data?.map(f => f.product_id) || []);
@@ -73,11 +88,13 @@ export default function Dashboard() {
   };
 
   const fetchCartCount = async () => {
+    if (!userId) return;
+    
     try {
       const { data, error } = await supabase
         .from('cart')
         .select('quantity')
-        .eq('user_id', user.id);
+        .eq('user_id', userId);
 
       if (error) throw error;
       const count = data?.reduce((sum, item) => sum + item.quantity, 0) || 0;
@@ -93,7 +110,7 @@ export default function Dashboard() {
       : products.filter((product) => product.category === activeCategory);
 
   const toggleFavorite = async (productId) => {
-    if (!user) {
+    if (!userId) {
       alert('Please login to add favorites');
       return;
     }
@@ -105,7 +122,7 @@ export default function Dashboard() {
         const { error } = await supabase
           .from('favorites')
           .delete()
-          .eq('user_id', user.id)
+          .eq('user_id', userId)
           .eq('product_id', productId);
 
         if (error) throw error;
@@ -114,7 +131,7 @@ export default function Dashboard() {
         const { error } = await supabase
           .from('favorites')
           .insert({
-            user_id: user.id,
+            user_id: userId,
             product_id: productId
           });
 
@@ -128,7 +145,7 @@ export default function Dashboard() {
   };
 
   const addToCart = (product) => {
-    if (!user) {
+    if (!userId) {
       alert('Please login to add items to cart');
       return;
     }
@@ -163,7 +180,7 @@ export default function Dashboard() {
       const { data: existingItem } = await supabase
         .from('cart')
         .select('*')
-        .eq('user_id', user.id)
+        .eq('user_id', userId)
         .eq('product_id', selectedProduct.id)
         .eq('product_variant_id', variant.id)
         .single();
@@ -181,7 +198,7 @@ export default function Dashboard() {
         const { error } = await supabase
           .from('cart')
           .insert({
-            user_id: user.id,
+            user_id: userId,
             product_id: selectedProduct.id,
             product_variant_id: variant.id,
             quantity: 1
@@ -424,7 +441,7 @@ export default function Dashboard() {
               <p className="text-xs text-gray-500 text-center mt-2">
                 Please select both color and size
               </p>
-            ) : null} 
+            ) : null}
           </div>
         </div>
       )}
